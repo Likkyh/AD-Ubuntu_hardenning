@@ -392,4 +392,4 @@ These items require human intervention. They are documented in `IMPLEMENTATION.m
 
 ## License
 
-Internal use only — Bidouille. Not for public distribution.
+[MIT License](LICENSE) — Copyright (c) 2026 Likkyh
