@@ -1,0 +1,41 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Generated reports (regenerated on each run)
+IMPLEMENTATION.ods
+
+# Runtime outputs — logs and backups contain sensitive system data
+logs/
+backups/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Secrets / sensitive files — never commit these
+*.reg
+*.inf
+*.csv
+*.wfw
+secedit*
+auditpol*
+
+# Compiled secedit databases
+*.sdb
+
+# Temporary files from hardening run
+hardening.inf
+secedit.sdb
