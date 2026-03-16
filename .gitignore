@@ -32,6 +32,7 @@ Thumbs.db
 *.wfw
 secedit*
 auditpol*
+.claude
 
 # Compiled secedit databases
 *.sdb
@@ -39,3 +40,6 @@ auditpol*
 # Temporary files from hardening run
 hardening.inf
 secedit.sdb
+
+# Documentation files
+*.pdf
