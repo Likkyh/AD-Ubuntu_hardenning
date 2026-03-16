@@ -2,13 +2,21 @@
 """
 harden.py — Bidouille AD DC + Ubuntu Hardening Script
 ======================================================
-Auto-detects OS and applies CIS/ISSP hardening.
+Single entry point that auto-detects the OS and dispatches to the appropriate
+hardening module.
+
+Behaviour:
+  Windows Server 2025 (detected as Domain Controller)
+    → modules/windows_dc.py  (CIS L1 DC + ISSP)
+  Ubuntu / Debian Linux
+    → modules/ubuntu.py      (CIS Ubuntu + ISSP)
 
 Usage:
-  Windows (as Administrator):  python harden.py
-  Linux (as root):             sudo python3 harden.py
-  Report only (any OS):        python3 harden.py --report-only
-  Skip backup:                 python3 harden.py --no-backup
+  Windows (as Administrator):   python harden.py
+  Linux   (as root):            sudo python3 harden.py
+  Report only (no changes):     python3 harden.py --report-only
+  Skip backup:                  python3 harden.py --no-backup
+  Override OS detection:        python3 harden.py --os-override ubuntu
 
 Company:  Bidouille (automotive sector)
 ISSP:     ISO 27002 v2
@@ -18,20 +26,24 @@ CIS Ref:  CIS Microsoft Windows Server 2025 Benchmark v2.0.0 — Level 1 DC
 import argparse
 import os
 import platform
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-# ─── Project root ─────────────────────────────────────────────────────────────
+# ── Project root paths ────────────────────────────────────────────────────────
+# All relative paths (logs/, backups/, reports) are anchored here so the script
+# works correctly regardless of the working directory it is launched from.
 SCRIPT_DIR = Path(__file__).parent.resolve()
-LOG_DIR = SCRIPT_DIR / "logs"
+LOG_DIR    = SCRIPT_DIR / "logs"
 BACKUP_DIR = SCRIPT_DIR / "backups"
 
-# ─── Ensure modules are importable ────────────────────────────────────────────
+# Make local modules importable when the script is invoked directly
 sys.path.insert(0, str(SCRIPT_DIR))
 
 
-def _banner():
+def _banner() -> None:
+    """Print a startup banner with the script title and current timestamp."""
     width = 70
     print("=" * width)
     print("  Bidouille — System Hardening Script".center(width))
@@ -43,30 +55,49 @@ def _banner():
 
 def _detect_os() -> tuple[str, bool]:
     """
-    Returns (os_type, is_dc) where:
-      os_type: 'windows' | 'ubuntu' | 'linux' | 'unknown'
-      is_dc:   True if Windows Domain Controller
+    Auto-detect the operating system and whether this machine is an AD DC.
+
+    On Windows, the Domain Controller role is identified via WMI's
+    Win32_ComputerSystem.DomainRole property:
+      0 = Standalone Workstation
+      1 = Member Workstation
+      2 = Standalone Server
+      3 = Member Server
+      4 = Backup Domain Controller
+      5 = Primary Domain Controller
+
+    Returns:
+        (os_type, is_dc) where:
+          os_type: "windows" | "ubuntu" | "debian" | "linux" | "unknown"
+          is_dc:   True only when running on a Windows DC (roles 4 or 5)
     """
     system = platform.system()
 
     if system == "Windows":
-        # Check if this is a Domain Controller
+        is_dc = False
         try:
-            import subprocess
             result = subprocess.run(
-                ["powershell", "-NonInteractive", "-NoProfile", "-Command",
-                 "(Get-WmiObject Win32_ComputerSystem).DomainRole"],
+                [
+                    "powershell", "-NonInteractive", "-NoProfile", "-Command",
+                    "(Get-WmiObject Win32_ComputerSystem).DomainRole"
+                ],
                 capture_output=True, text=True, timeout=15
             )
             role = result.stdout.strip()
-            # DomainRole: 4 = Backup DC, 5 = Primary DC
+            # Roles 4 and 5 are DC roles
             is_dc = role in ("4", "5")
-        except Exception:
-            is_dc = False
+        except FileNotFoundError:
+            # PowerShell not found — unlikely on a real Windows machine
+            print("[WARN] PowerShell not found; cannot determine DC role.")
+        except subprocess.TimeoutExpired:
+            print("[WARN] DC role detection timed out; defaulting to non-DC.")
+        except OSError as exc:
+            # Covers WinError, permission issues launching powershell, etc.
+            print(f"[WARN] DC role detection failed ({exc}); defaulting to non-DC.")
         return "windows", is_dc
 
     elif system == "Linux":
-        # Check Linux distro
+        # Read /etc/os-release to determine the specific Linux distribution
         try:
             with open("/etc/os-release") as f:
                 content = f.read().lower()
@@ -77,24 +108,46 @@ def _detect_os() -> tuple[str, bool]:
             else:
                 return "linux", False
         except FileNotFoundError:
+            # /etc/os-release missing — very unusual, treat as generic Linux
             return "linux", False
 
     return "unknown", False
 
 
 def _check_privileges(os_type: str) -> bool:
-    """Verify the script is running with admin/root privileges."""
+    """
+    Verify that the script is running with the privileges required to modify
+    system configuration.
+
+    Windows: must be run as Administrator (elevated token).
+    Linux:   must be run as root (UID 0).
+
+    Args:
+        os_type: "windows" | "ubuntu" | "debian" | "linux"
+
+    Returns:
+        True if sufficient privileges are detected, False otherwise.
+    """
     if os_type == "windows":
         try:
             import ctypes
-            return ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (AttributeError, OSError):
+            # ctypes or windll not available — assume not elevated
             return False
     else:
+        # On POSIX systems, UID 0 means root
         return os.geteuid() == 0
 
 
-def main():
+def main() -> int:
+    """
+    Parse arguments, detect the environment, run the backup, dispatch to the
+    correct hardening module, and generate compliance reports.
+
+    Returns:
+        Exit code: 0 = success, 1 = error (unsupported OS, missing privileges…)
+    """
     parser = argparse.ArgumentParser(
         description="Bidouille System Hardening Script — CIS/ISSP",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -113,105 +166,108 @@ def main():
     parser.add_argument(
         "--os-override",
         choices=["windows", "ubuntu", "linux"],
-        help="Override OS detection (for testing)"
+        help="Force a specific OS profile instead of auto-detecting"
     )
     args = parser.parse_args()
 
     _banner()
 
-    # ── Setup logging ──
-    from modules.logger import setup_logger, get_logger, log_ok, log_warn, log_fail
+    # ── Logging setup ─────────────────────────────────────────────────────────
+    from modules.logger import setup_logger, log_ok, log_warn, get_log_path
     logger = setup_logger(str(LOG_DIR))
-    from modules.logger import get_log_path
     logger.info(f"Log file: {get_log_path()}")
 
-    # ── OS detection ──
+    # ── OS detection ──────────────────────────────────────────────────────────
     if args.os_override:
+        # Manual override: treat the given OS as the target.
+        # When overriding to "windows" we assume DC because that is the only
+        # Windows profile this script supports.
         os_type = args.os_override
-        is_dc = (os_type == "windows")
-        logger.info(f"OS override: {os_type} (is_dc={is_dc})")
+        is_dc   = (os_type == "windows")
+        logger.info(f"OS override applied: {os_type} (is_dc={is_dc})")
     else:
         os_type, is_dc = _detect_os()
 
-    logger.info(f"Detected OS: {os_type} | Domain Controller: {is_dc}")
-    logger.info(f"Python: {sys.version}")
-    logger.info(f"Platform: {platform.platform()}")
-    logger.info(f"Hostname: {platform.node()}")
+    logger.info(f"Target OS : {os_type}  |  Domain Controller: {is_dc}")
+    logger.info(f"Python    : {sys.version.split()[0]}")
+    logger.info(f"Platform  : {platform.platform()}")
+    logger.info(f"Hostname  : {platform.node()}")
     logger.info("")
 
-    # ── Report-only mode ──
+    # ── Report-only mode ──────────────────────────────────────────────────────
+    # Generates IMPLEMENTATION.md + IMPLEMENTATION.ods without touching the
+    # system configuration.  Safe to run on any machine, no privileges needed.
     if args.report_only:
-        logger.info("Report-only mode — generating IMPLEMENTATION.md and IMPLEMENTATION.ods")
+        logger.info("Report-only mode — generating compliance reports (no changes applied)")
         from modules.report import generate_reports
         generate_reports(str(SCRIPT_DIR))
-        logger.info("Done. No system changes were made.")
+        logger.info("Done.")
         return 0
 
-    # ── Privilege check ──
+    # ── Privilege check ───────────────────────────────────────────────────────
     if not _check_privileges(os_type):
-        logger.error(
-            "This script must be run as Administrator (Windows) or root (Linux)."
-        )
+        logger.error("Insufficient privileges. This script must run as:")
         if os_type == "windows":
-            logger.error("Right-click your terminal and select 'Run as Administrator'.")
+            logger.error("  → Administrator  (right-click → Run as Administrator)")
         else:
-            logger.error("Run: sudo python3 harden.py")
+            logger.error("  → root           (sudo python3 harden.py)")
         return 1
 
-    log_ok(f"Running with sufficient privileges")
+    log_ok("Running with sufficient privileges")
 
-    # ── Backup ──
+    # ── Pre-hardening backup ──────────────────────────────────────────────────
     if not args.no_backup:
         from modules.backup import perform_backup
-        logger.info("Creating pre-hardening backup...")
+        logger.info("Creating pre-hardening backup (do not interrupt)...")
         backup_path = perform_backup(str(BACKUP_DIR))
         logger.info(f"Backup saved to: {backup_path}")
     else:
-        log_warn("Backup skipped (--no-backup flag)")
+        log_warn("Backup skipped (--no-backup). Rollback will not be possible.")
 
-    # ── Hardening ──
+    # ── Hardening dispatch ────────────────────────────────────────────────────
     exit_code = 0
-    if os_type == "windows":
-        if is_dc:
-            logger.info("Target: Windows Server 2025 Domain Controller")
-            from modules.windows_dc import harden
-            harden()
-        else:
-            logger.warning(
-                "This machine does not appear to be a Domain Controller. "
-                "Applying Windows DC hardening anyway (some DC-specific settings may not apply)."
-            )
-            from modules.windows_dc import harden
-            harden()
 
-    elif os_type in ("ubuntu", "linux", "debian"):
-        logger.info(f"Target: {os_type.capitalize()} workstation/server")
+    if os_type == "windows":
+        if not is_dc:
+            log_warn(
+                "This machine does not appear to be a Domain Controller "
+                "(DomainRole not 4 or 5). Applying DC profile anyway — "
+                "some DC-specific settings may fail silently."
+            )
+        from modules.windows_dc import harden
+        harden()
+
+    elif os_type in ("ubuntu", "debian", "linux"):
         from modules.ubuntu import harden
         harden()
 
     else:
-        logger.error(f"Unsupported OS: {os_type}. Supported: Windows, Ubuntu/Debian Linux.")
+        logger.error(
+            f"Unsupported OS: '{os_type}'. "
+            "Supported targets: Windows Server 2025 (DC), Ubuntu / Debian Linux."
+        )
         exit_code = 1
 
-    # ── Generate reports ──
+    # ── Compliance reports ────────────────────────────────────────────────────
+    # Always generate reports at the end of a run (even if some items failed)
+    # so the admin has a full picture of what was and wasn't applied.
     logger.info("\nGenerating compliance reports...")
     try:
         from modules.report import generate_reports
         generate_reports(str(SCRIPT_DIR))
-    except Exception as e:
-        log_warn(f"Report generation failed: {e}")
+    except Exception as exc:
+        log_warn(f"Report generation failed: {exc}")
 
-    # ── Summary ──
-    from modules.logger import get_log_path
+    # ── Run summary ───────────────────────────────────────────────────────────
     log_file = get_log_path()
     print()
     print("=" * 70)
     print("  Hardening run complete.")
-    print(f"  Log:    {log_file}")
-    print(f"  Report: {SCRIPT_DIR / 'IMPLEMENTATION.md'}")
-    print(f"  Sheet:  {SCRIPT_DIR / 'IMPLEMENTATION.ods'}")
+    print(f"  Log    : {log_file}")
+    print(f"  Report : {SCRIPT_DIR / 'IMPLEMENTATION.md'}")
+    print(f"  Sheet  : {SCRIPT_DIR / 'IMPLEMENTATION.ods'}")
     if not args.no_backup:
-        print(f"  Backup: {BACKUP_DIR}")
+        print(f"  Backup : {BACKUP_DIR}")
     print("=" * 70)
 
     return exit_code

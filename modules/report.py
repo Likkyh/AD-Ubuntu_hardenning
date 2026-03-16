@@ -1,42 +1,108 @@
 """
-Report generator: writes IMPLEMENTATION.md and IMPLEMENTATION.ods
-Color coding: green=Implemented, red=Not Implemented, yellow=Manual
+modules/report.py — Compliance report generator.
+
+Produces two output files after each hardening run (or on demand with
+--report-only):
+
+  IMPLEMENTATION.md   Plain-text Markdown table, one row per hardening item,
+                      with status (Implemented / Not Implemented / Manual) and
+                      the reason when a control was not automated.
+
+  IMPLEMENTATION.ods  LibreOffice Calc spreadsheet with three sheets:
+                        • Windows DC  — all WDC-xxx items
+                        • Ubuntu      — all UBU-xxx items
+                        • Summary     — per-OS totals by status
+                      Rows are color-coded: green = Implemented,
+                      red = Not Implemented, yellow = Manual.
+
+The canonical list of all hardening items is defined in this module
+(WINDOWS_DC_ITEMS and UBUNTU_ITEMS).  The hardening modules (windows_dc.py,
+ubuntu.py) update status in-memory and pass the updated lists to
+generate_reports(); when called with no arguments the module-level defaults
+are used (all items at their pre-set status).
+
+Dependency: odfpy >= 1.4.1  (pip install odfpy).  If the library is absent,
+the .ods file is skipped with a warning — the Markdown report is always
+generated.
 """
 
 import os
-from typing import List, Dict
-from modules.logger import get_logger, log_ok, log_warn
+from datetime import datetime
+from typing import Dict, List, Optional
 
-# Status constants
-STATUS_IMPLEMENTED = "Implemented"
+from modules.logger import log_ok, log_warn
+
+# ── Try to import odfpy at module load time so the import error is surfaced ──
+# early rather than at the moment write_ods() is first called.  If the library
+# is not installed we set a flag and skip ODS generation gracefully.
+try:
+    from odf.opendocument import OpenDocumentSpreadsheet
+    from odf.style import Style, TableCellProperties, TextProperties
+    from odf.table import Table, TableCell, TableRow
+    from odf.text import P
+    _ODF_AVAILABLE = True
+except ImportError:
+    _ODF_AVAILABLE = False
+
+# ── Status string constants ───────────────────────────────────────────────────
+# Use these everywhere instead of raw strings to avoid typos and make
+# global search/replace easy if the wording ever changes.
+STATUS_IMPLEMENTED     = "Implemented"
 STATUS_NOT_IMPLEMENTED = "Not Implemented"
-STATUS_MANUAL = "Manual"
+STATUS_MANUAL          = "Manual"
 
 
 class HardeningItem:
-    def __init__(self, item_id: str, category: str, description: str,
-                 source: str, status: str, reason: str = ""):
-        self.item_id = item_id
-        self.category = category
-        self.description = description
-        self.source = source
-        self.status = status
-        self.reason = reason
+    """
+    Represents a single hardening control from the CIS benchmark or ISSP.
 
-    def to_dict(self) -> Dict:
+    Attributes:
+        item_id     Unique identifier, e.g. "WDC-001" or "UBU-042".
+        category    High-level grouping, e.g. "Account Policy", "SSH", "Audit Policy".
+        description Human-readable description of the setting and its target value.
+        source      Normative reference, e.g. "CIS 1.1.1" or "ISSP §7.1".
+        status      One of STATUS_IMPLEMENTED, STATUS_NOT_IMPLEMENTED, STATUS_MANUAL.
+        reason      Explanation when status is not Implemented (empty string otherwise).
+    """
+
+    def __init__(self, item_id: str, category: str, description: str,
+                 source: str, status: str, reason: str = "") -> None:
+        self.item_id     = item_id
+        self.category    = category
+        self.description = description
+        self.source      = source
+        self.status      = status
+        self.reason      = reason
+
+    def to_dict(self) -> Dict[str, str]:
+        """Return a plain dict representation suitable for serialisation."""
         return {
-            "ID": self.item_id,
-            "Category": self.category,
-            "Hardening Point": self.description,
-            "Source": self.source,
-            "Status": self.status,
+            "ID":                        self.item_id,
+            "Category":                  self.category,
+            "Hardening Point":           self.description,
+            "Source":                    self.source,
+            "Status":                    self.status,
             "Reason if Not Implemented": self.reason,
         }
 
 
 # ─── Master hardening item tables ────────────────────────────────────────────
+# These lists are the single source of truth for every hardening control.
+# Each entry maps directly to one row in IMPLEMENTATION.md and IMPLEMENTATION.ods.
+#
+# HardeningItem arguments:  item_id, category, description, source, status[, reason]
+#
+# Status values:
+#   STATUS_IMPLEMENTED     — the script applies this control automatically
+#   STATUS_NOT_IMPLEMENTED — the script does NOT apply it; reason is required
+#   STATUS_MANUAL          — procedural/org control; cannot be automated
+#
+# Windows DC items (WDC-001 … WDC-351) follow the CIS Windows Server 2025
+# Benchmark v2.0.0, Level 1, Domain Controller profile, supplemented by
+# company ISSP (ISO 27002 v2) controls.
 
 WINDOWS_DC_ITEMS: List[HardeningItem] = [
+    # ── CIS 1.1 — Account Policies / Password Policy ─────────────────────────
     HardeningItem("WDC-001","Account Policy","Password history = 24","CIS 1.1.1",STATUS_IMPLEMENTED),
     HardeningItem("WDC-002","Account Policy","Max password age = 90 days","CIS 1.1.2 + ISSP §7.1",STATUS_IMPLEMENTED),
     HardeningItem("WDC-003","Account Policy","Min password age = 1 day","CIS 1.1.3",STATUS_IMPLEMENTED),
@@ -397,7 +463,10 @@ WINDOWS_DC_ITEMS: List[HardeningItem] = [
         "Organizational naming convention. Script validates and reports but cannot enforce account restructuring."),
 ]
 
+# Ubuntu client items (UBU-001 … UBU-113) follow the CIS Ubuntu Linux
+# Benchmark, supplemented by company ISSP (ISO 27002 v2) controls.
 UBUNTU_ITEMS: List[HardeningItem] = [
+    # ── Firewall (UFW) ────────────────────────────────────────────────────────
     HardeningItem("UBU-001","Firewall","Install and enable UFW","CIS",STATUS_IMPLEMENTED),
     HardeningItem("UBU-002","Firewall","UFW default deny incoming","CIS",STATUS_IMPLEMENTED),
     HardeningItem("UBU-003","Firewall","UFW default allow outgoing","CIS",STATUS_IMPLEMENTED),
@@ -524,36 +593,55 @@ UBUNTU_ITEMS: List[HardeningItem] = [
 # ─── Markdown report ─────────────────────────────────────────────────────────
 
 def _md_table(items: List[HardeningItem]) -> str:
-    header = "| ID | Category | Hardening Point | Source | Status | Reason if Not Implemented |\n"
+    """
+    Render a list of HardeningItems as a GitHub-flavored Markdown table string.
+
+    Args:
+        items: Ordered list of hardening controls to tabulate.
+
+    Returns:
+        Multi-line string containing the complete Markdown table.
+    """
+    header    = "| ID | Category | Hardening Point | Source | Status | Reason if Not Implemented |\n"
     separator = "|----|----------|-----------------|--------|--------|---------------------------|\n"
-    rows = ""
-    for item in items:
-        rows += (
-            f"| {item.item_id} | {item.category} | {item.description} "
-            f"| {item.source} | {item.status} | {item.reason} |\n"
-        )
+    rows = "".join(
+        f"| {item.item_id} | {item.category} | {item.description} "
+        f"| {item.source} | {item.status} | {item.reason} |\n"
+        for item in items
+    )
     return header + separator + rows
 
 
 def write_markdown(output_path: str,
-                   windows_items: List[HardeningItem] = None,
-                   ubuntu_items: List[HardeningItem] = None):
+                   windows_items: Optional[List[HardeningItem]] = None,
+                   ubuntu_items:  Optional[List[HardeningItem]] = None) -> None:
+    """
+    Write the full compliance report as a Markdown file.
+
+    The file contains a legend, a per-OS summary table, and two detailed
+    tables (Windows DC and Ubuntu) with one row per hardening control.
+
+    Args:
+        output_path:   Absolute path to write the .md file (e.g. project_root/IMPLEMENTATION.md).
+        windows_items: Windows DC hardening items; defaults to WINDOWS_DC_ITEMS.
+        ubuntu_items:  Ubuntu hardening items; defaults to UBUNTU_ITEMS.
+    """
     if windows_items is None:
         windows_items = WINDOWS_DC_ITEMS
     if ubuntu_items is None:
         ubuntu_items = UBUNTU_ITEMS
 
-    wdc_total = len(windows_items)
-    wdc_impl = sum(1 for i in windows_items if i.status == STATUS_IMPLEMENTED)
-    wdc_not = sum(1 for i in windows_items if i.status == STATUS_NOT_IMPLEMENTED)
+    # ── Compute per-OS status counts for the summary table ───────────────────
+    wdc_total  = len(windows_items)
+    wdc_impl   = sum(1 for i in windows_items if i.status == STATUS_IMPLEMENTED)
+    wdc_not    = sum(1 for i in windows_items if i.status == STATUS_NOT_IMPLEMENTED)
     wdc_manual = sum(1 for i in windows_items if i.status == STATUS_MANUAL)
 
-    ubu_total = len(ubuntu_items)
-    ubu_impl = sum(1 for i in ubuntu_items if i.status == STATUS_IMPLEMENTED)
-    ubu_not = sum(1 for i in ubuntu_items if i.status == STATUS_NOT_IMPLEMENTED)
+    ubu_total  = len(ubuntu_items)
+    ubu_impl   = sum(1 for i in ubuntu_items if i.status == STATUS_IMPLEMENTED)
+    ubu_not    = sum(1 for i in ubuntu_items if i.status == STATUS_NOT_IMPLEMENTED)
     ubu_manual = sum(1 for i in ubuntu_items if i.status == STATUS_MANUAL)
 
-    from datetime import datetime
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     content = f"""# IMPLEMENTATION — AD DC + Ubuntu Hardening
@@ -589,65 +677,97 @@ def write_markdown(output_path: str,
 {_md_table(ubuntu_items)}
 """
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    log_ok(f"IMPLEMENTATION.md written → {output_path}")
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log_ok(f"IMPLEMENTATION.md written → {output_path}")
+    except OSError as exc:
+        log_warn(f"Could not write IMPLEMENTATION.md: {exc}")
 
 
 # ─── ODS report ──────────────────────────────────────────────────────────────
 
 def write_ods(output_path: str,
-              windows_items: List[HardeningItem] = None,
-              ubuntu_items: List[HardeningItem] = None):
+              windows_items: Optional[List[HardeningItem]] = None,
+              ubuntu_items:  Optional[List[HardeningItem]] = None) -> None:
+    """
+    Write the compliance data as a color-coded LibreOffice Calc (.ods) file.
+
+    The workbook contains three sheets:
+      • "Windows DC"  — all WDC-xxx items
+      • "Ubuntu"      — all UBU-xxx items
+      • "Summary"     — per-OS row with totals by status
+
+    Row color convention:
+      Green  (#C6EFCE) — Implemented
+      Red    (#FFC7CE) — Not Implemented
+      Yellow (#FFEB9C) — Manual
+
+    If the odfpy library is not installed the function logs a warning and
+    returns without raising an exception, so the overall hardening run is
+    not aborted just because the spreadsheet cannot be generated.
+
+    Args:
+        output_path:   Absolute path to write the .ods file.
+        windows_items: Windows DC hardening items; defaults to WINDOWS_DC_ITEMS.
+        ubuntu_items:  Ubuntu hardening items; defaults to UBUNTU_ITEMS.
+    """
+    if not _ODF_AVAILABLE:
+        # odfpy failed to import at module load time — skip gracefully.
+        log_warn("odfpy not installed — skipping ODS generation.  Run: pip install odfpy")
+        return
+
     if windows_items is None:
         windows_items = WINDOWS_DC_ITEMS
     if ubuntu_items is None:
         ubuntu_items = UBUNTU_ITEMS
 
-    try:
-        from odf.opendocument import OpenDocumentSpreadsheet
-        from odf.style import Style, TableCellProperties, TextProperties, ParagraphProperties
-        from odf.table import Table, TableRow, TableCell, TableColumn
-        from odf.text import P
-        from odf import style as odfstyle
-    except ImportError:
-        log_warn("odfpy not installed. Run: pip install odfpy")
-        log_warn("Skipping ODS generation.")
-        return
-
     doc = OpenDocumentSpreadsheet()
 
-    # ── Styles ──
-    def _make_style(name, bg_color, bold=False):
+    # ── Cell style factory ────────────────────────────────────────────────────
+    # Each style is registered once in the document's automatic-styles section.
+    # The function returns the style *name* (a string) passed to
+    # TableCell(stylename=...) when building rows.
+    def _make_style(name: str, bg_color: str, bold: bool = False) -> str:
         st = Style(name=name, family="table-cell")
-        tcp = TableCellProperties(backgroundcolor=bg_color, border="0.05pt solid #000000")
-        st.addElement(tcp)
-        tp = TextProperties(fontweight="bold" if bold else "normal")
-        st.addElement(tp)
+        # Background fill + thin border on every cell edge
+        st.addElement(TableCellProperties(
+            backgroundcolor=bg_color,
+            border="0.05pt solid #000000"
+        ))
+        # Font weight (header row is bold, data rows are normal)
+        st.addElement(TextProperties(fontweight="bold" if bold else "normal"))
         doc.automaticstyles.addElement(st)
         return name
 
-    style_header = _make_style("header_style", "#4472C4", bold=True)
-    style_implemented = _make_style("impl_style", "#C6EFCE")
-    style_not_impl = _make_style("notimpl_style", "#FFC7CE")
-    style_manual = _make_style("manual_style", "#FFEB9C")
-    style_default = _make_style("default_style", "#FFFFFF")
+    # Register all styles used across all sheets
+    style_header      = _make_style("header_style",  "#4472C4", bold=True)  # dark-blue header
+    style_implemented = _make_style("impl_style",    "#C6EFCE")             # light green
+    style_not_impl    = _make_style("notimpl_style", "#FFC7CE")             # light red
+    style_manual      = _make_style("manual_style",  "#FFEB9C")             # light yellow
+    style_default     = _make_style("default_style", "#FFFFFF")             # white (summary rows)
 
-    def _cell(text, stylename=None):
-        if stylename:
-            tc = TableCell(stylename=stylename, valuetype="string")
-        else:
-            tc = TableCell(valuetype="string")
+    # ── Cell / row helpers ────────────────────────────────────────────────────
+
+    def _cell(text, stylename: Optional[str] = None) -> TableCell:
+        """Create a single string-typed ODS table cell with optional style."""
+        tc = TableCell(
+            stylename=stylename if stylename else "",
+            valuetype="string"
+        )
         tc.addElement(P(text=str(text) if text is not None else ""))
         return tc
 
-    def _header_row(table, columns):
+    def _header_row(table: Table, columns: List[str]) -> None:
+        """Append a bold header row to *table*."""
         tr = TableRow()
         for col in columns:
             tr.addElement(_cell(col, style_header))
         table.addElement(tr)
 
-    def _data_row(table, item: HardeningItem):
+    def _data_row(table: Table, item: HardeningItem) -> None:
+        """Append a color-coded data row for *item* to *table*."""
+        # Pick background color based on implementation status
         if item.status == STATUS_IMPLEMENTED:
             row_style = style_implemented
         elif item.status == STATUS_NOT_IMPLEMENTED:
@@ -655,52 +775,71 @@ def write_ods(output_path: str,
         elif item.status == STATUS_MANUAL:
             row_style = style_manual
         else:
-            row_style = style_default
+            row_style = style_default  # unknown status — white
+
         tr = TableRow()
         for val in [item.item_id, item.category, item.description,
                     item.source, item.status, item.reason]:
             tr.addElement(_cell(val, row_style))
         table.addElement(tr)
 
-    COLUMNS = ["ID", "Category", "Hardening Point", "Source", "Status", "Reason if Not Implemented"]
+    COLUMNS = ["ID", "Category", "Hardening Point", "Source", "Status",
+               "Reason if Not Implemented"]
 
-    # Sheet 1: Windows DC
+    # ── Sheet 1: Windows DC ───────────────────────────────────────────────────
     sheet_win = Table(name="Windows DC")
     _header_row(sheet_win, COLUMNS)
     for item in windows_items:
         _data_row(sheet_win, item)
     doc.spreadsheet.addElement(sheet_win)
 
-    # Sheet 2: Ubuntu
+    # ── Sheet 2: Ubuntu ───────────────────────────────────────────────────────
     sheet_ubu = Table(name="Ubuntu")
     _header_row(sheet_ubu, COLUMNS)
     for item in ubuntu_items:
         _data_row(sheet_ubu, item)
     doc.spreadsheet.addElement(sheet_ubu)
 
-    # Sheet 3: Summary
+    # ── Sheet 3: Summary ──────────────────────────────────────────────────────
     sheet_sum = Table(name="Summary")
     _header_row(sheet_sum, ["OS", "Total", "Implemented", "Not Implemented", "Manual"])
-
     for label, items in [("Windows DC", windows_items), ("Ubuntu", ubuntu_items)]:
-        total = len(items)
-        impl = sum(1 for i in items if i.status == STATUS_IMPLEMENTED)
+        total    = len(items)
+        impl     = sum(1 for i in items if i.status == STATUS_IMPLEMENTED)
         not_impl = sum(1 for i in items if i.status == STATUS_NOT_IMPLEMENTED)
-        manual = sum(1 for i in items if i.status == STATUS_MANUAL)
+        manual   = sum(1 for i in items if i.status == STATUS_MANUAL)
         tr = TableRow()
         for val in [label, total, impl, not_impl, manual]:
             tr.addElement(_cell(val, style_default))
         sheet_sum.addElement(tr)
     doc.spreadsheet.addElement(sheet_sum)
 
-    doc.save(output_path)
-    log_ok(f"IMPLEMENTATION.ods written → {output_path}")
+    # ── Save to disk ──────────────────────────────────────────────────────────
+    try:
+        doc.save(output_path)
+        log_ok(f"IMPLEMENTATION.ods written → {output_path}")
+    except OSError as exc:
+        log_warn(f"Could not write IMPLEMENTATION.ods: {exc}")
 
+
+# ─── Public entry point ───────────────────────────────────────────────────────
 
 def generate_reports(project_root: str,
-                     windows_items: List[HardeningItem] = None,
-                     ubuntu_items: List[HardeningItem] = None):
-    md_path = os.path.join(project_root, "IMPLEMENTATION.md")
+                     windows_items: Optional[List[HardeningItem]] = None,
+                     ubuntu_items:  Optional[List[HardeningItem]] = None) -> None:
+    """
+    Generate both compliance reports (Markdown + ODS) in the project root.
+
+    This is the single function called by harden.py at the end of every run
+    and by --report-only mode.  Both output paths are derived from
+    *project_root* so callers don't need to know the file names.
+
+    Args:
+        project_root:  Root directory of the hardening project (where harden.py lives).
+        windows_items: Optional override for the Windows DC item list.
+        ubuntu_items:  Optional override for the Ubuntu item list.
+    """
+    md_path  = os.path.join(project_root, "IMPLEMENTATION.md")
     ods_path = os.path.join(project_root, "IMPLEMENTATION.ods")
-    write_markdown(md_path, windows_items, ubuntu_items)
-    write_ods(ods_path, windows_items, ubuntu_items)
+    write_markdown(md_path,  windows_items, ubuntu_items)
+    write_ods(ods_path,      windows_items, ubuntu_items)
